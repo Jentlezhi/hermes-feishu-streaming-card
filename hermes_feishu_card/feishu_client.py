@@ -162,6 +162,7 @@ class FeishuClient:
         card: Dict[str, Any],
         thread_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
+        content_override: Optional[str] = None,
     ) -> Dict[str, str]:
         if not isinstance(chat_id, str) or not chat_id.strip():
             raise ValueError("chat_id is required")
@@ -174,7 +175,11 @@ class FeishuClient:
             # no anchor exists, deliver to the parent chat instead.
             "receive_id": chat_id,
             "msg_type": "interactive",
-            "content": serialize_card_for_delivery(card),
+            "content": (
+                content_override
+                if content_override is not None
+                else serialize_card_for_delivery(card)
+            ),
         }
 
     async def send_card(
@@ -204,6 +209,7 @@ class FeishuClient:
         reply_to_message_id: Optional[str] = None,
         delivery_uuid: Optional[str] = None,
         reply_in_thread: bool = False,
+        content_override: Optional[str] = None,
     ) -> FeishuSendResult:
         if reply_in_thread and not reply_to_message_id:
             raise ValueError("reply_to_message_id is required for reply_in_thread")
@@ -218,6 +224,7 @@ class FeishuClient:
             card,
             thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
+            content_override=content_override,
         )
         if delivery_uuid is not None and not reply_to_message_id:
             payload["uuid"] = delivery_uuid
@@ -300,6 +307,132 @@ class FeishuClient:
             f"/im/v1/messages/{quote(message_id, safe='')}",
             token=token,
             json_body={"content": content},
+        )
+
+    # --- CardKit entity transport -------------------------------------------
+    #
+    # A CardKit card entity (``card_id``) can be streamed element by element,
+    # which is what makes the Feishu client animate text instead of replacing
+    # the whole card. Messages referencing an entity cannot be PATCHed, so this
+    # transport is all-or-nothing per message.
+
+    async def cardkit_create_card(self, card: Dict[str, Any]) -> str:
+        """Create a CardKit card entity and return its ``card_id``."""
+
+        if not isinstance(card, dict):
+            raise TypeError("card must be a dict")
+        token = await self._tenant_token()
+        payload = await self._request_json(
+            "POST",
+            "/cardkit/v1/cards",
+            token=token,
+            json_body={
+                "type": "card_json",
+                "data": serialize_card_for_delivery(card),
+            },
+        )
+        data = payload.get("data")
+        card_id = data.get("card_id") if isinstance(data, dict) else None
+        if not isinstance(card_id, str) or not card_id.strip():
+            raise FeishuAPIError(
+                "CardKit create response missing card_id",
+                retryable=False,
+                outcome="not_sent",
+            )
+        return card_id
+
+    async def cardkit_update_card(
+        self,
+        card_id: str,
+        card: Dict[str, Any],
+        *,
+        sequence: int = 0,
+        request_uuid: Optional[str] = None,
+    ) -> None:
+        """Replace the whole content of a CardKit card entity."""
+
+        if not isinstance(card_id, str) or not card_id.strip():
+            raise ValueError("card_id is required")
+        if not isinstance(card, dict):
+            raise TypeError("card must be a dict")
+        body: dict[str, Any] = {
+            "card": {
+                "type": "card_json",
+                "data": serialize_card_for_delivery(card),
+            },
+            "sequence": int(sequence),
+        }
+        if request_uuid is not None:
+            body["uuid"] = request_uuid
+        token = await self._tenant_token()
+        await self._request_json(
+            "PUT",
+            f"/cardkit/v1/cards/{quote(card_id, safe='')}",
+            token=token,
+            json_body=body,
+        )
+
+    async def cardkit_stream_element(
+        self,
+        card_id: str,
+        element_id: str,
+        content: str,
+        *,
+        sequence: int = 0,
+        request_uuid: Optional[str] = None,
+    ) -> None:
+        """Push element content into a CardKit card entity (typewriter)."""
+
+        if not isinstance(card_id, str) or not card_id.strip():
+            raise ValueError("card_id is required")
+        if not isinstance(element_id, str) or not element_id.strip():
+            raise ValueError("element_id is required")
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        body: dict[str, Any] = {"content": content, "sequence": int(sequence)}
+        if request_uuid is not None:
+            body["uuid"] = request_uuid
+        token = await self._tenant_token()
+        await self._request_json(
+            "PUT",
+            (
+                f"/cardkit/v1/cards/{quote(card_id, safe='')}"
+                f"/elements/{quote(element_id, safe='')}/content"
+            ),
+            token=token,
+            json_body=body,
+        )
+
+    async def cardkit_set_streaming(
+        self,
+        card_id: str,
+        *,
+        enabled: bool,
+        sequence: int = 0,
+        config: Optional[Dict[str, Any]] = None,
+        request_uuid: Optional[str] = None,
+    ) -> None:
+        """Open or close streaming mode on a CardKit card entity."""
+
+        if not isinstance(card_id, str) or not card_id.strip():
+            raise ValueError("card_id is required")
+        settings: dict[str, Any] = {"streaming_mode": bool(enabled)}
+        if enabled and config is not None:
+            settings["streaming_config"] = config
+        body: dict[str, Any] = {
+            "settings": json.dumps(
+                settings, ensure_ascii=False, separators=(",", ":")
+            ),
+            "sequence": int(sequence),
+        }
+        if request_uuid is not None:
+            body["uuid"] = request_uuid
+        token = await self._tenant_token()
+        await self._request_json(
+            "PATCH",
+            f"/cardkit/v1/cards/{quote(card_id, safe='')}/settings",
+            token=token,
+            json_body=body,
         )
 
     async def send_text_message(

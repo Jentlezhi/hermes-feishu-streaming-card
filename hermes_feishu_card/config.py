@@ -34,6 +34,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_wait_ms": 800,
         "max_chars": 240,
         "flush_interval_ms": 200,
+        "cardkit_streaming": False,
         "final_drain_timeout_ms": 900,
         "title": "Hermes Agent",
         "interaction_mode": "auto",

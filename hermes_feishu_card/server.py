@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from . import cardkit_stream
 from .bots import RouteResult
 from .config import (
     card_completion_mention_enabled,
@@ -6710,8 +6711,21 @@ async def _send_card_for_app(
     )
     client = _client_for_bot(app, bot_id)
     try:
+        cardkit_result = await cardkit_stream.send_cardkit_delivery(
+            client=client,
+            chat_id=chat_id,
+            card=card,
+            card_config=app.get(BASE_CARD_CONFIG_KEY),
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            delivery_uuid=delivery_uuid,
+            reply_in_thread=reply_in_thread,
+        )
         send_delivery = getattr(client, "send_card_delivery", None)
-        if callable(send_delivery):
+        if cardkit_result is not None:
+            message_id = str(getattr(cardkit_result, "message_id", "") or "")
+            retry_count = int(getattr(cardkit_result, "retry_count", 0) or 0)
+        elif callable(send_delivery):
             send_kwargs: dict[str, Any] = {
                 "thread_id": thread_id,
                 "reply_to_message_id": reply_to_message_id,
@@ -6838,7 +6852,11 @@ async def _update_card_for_app(
         metrics.feishu_update_attempts += 1
         started_at = time.monotonic()
         try:
-            await _client_for_bot(app, bot_id).update_card_message(message_id, card)
+            update_client = _client_for_bot(app, bot_id)
+            if not await cardkit_stream.deliver_card_update(
+                update_client, message_id, card
+            ):
+                await update_client.update_card_message(message_id, card)
         except Exception as exc:
             metrics.feishu_update_latency_ms = int(
                 (time.monotonic() - started_at) * 1000
