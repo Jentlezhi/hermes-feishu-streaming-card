@@ -6716,6 +6716,7 @@ async def _send_card_for_app(
             chat_id=chat_id,
             card=card,
             card_config=app.get(BASE_CARD_CONFIG_KEY),
+            diagnostics=app[DIAGNOSTICS_KEY],
             thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
             delivery_uuid=delivery_uuid,
@@ -6854,7 +6855,7 @@ async def _update_card_for_app(
         try:
             update_client = _client_for_bot(app, bot_id)
             if not await cardkit_stream.deliver_card_update(
-                update_client, message_id, card
+                update_client, message_id, card, app[DIAGNOSTICS_KEY]
             ):
                 await update_client.update_card_message(message_id, card)
         except Exception as exc:

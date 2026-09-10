@@ -234,12 +234,32 @@ def registry() -> CardKitRegistry:
 
 
 def _safe_error(exc: BaseException) -> str:
+    """Compact error text for logs — must keep the Feishu api_code visible."""
+
     text = str(exc) or exc.__class__.__name__
-    return text[:200]
+    detail = text[:120]
+    api_code = getattr(exc, "api_code", None)
+    status_code = getattr(exc, "status_code", None)
+    if api_code is not None:
+        detail += f" api_code={api_code}"
+    if status_code is not None:
+        detail += f" status={status_code}"
+    return detail[:240]
 
 
 def is_streaming_closed(exc: BaseException) -> bool:
     return isinstance(exc, FeishuAPIError) and exc.api_code == STREAMING_CLOSED_API_CODE
+
+
+def _bump(diagnostics: Optional[Dict[str, Any]], key: str) -> None:
+    """Increment a delivery counter exposed through the sidecar's ``/health``."""
+
+    if diagnostics is None:
+        return
+    try:
+        diagnostics[key] = int(diagnostics.get(key, 0)) + 1
+    except (TypeError, ValueError):
+        diagnostics[key] = 1
 
 
 async def send_cardkit_delivery(
@@ -248,6 +268,7 @@ async def send_cardkit_delivery(
     chat_id: str,
     card: Mapping[str, Any],
     card_config: Optional[Mapping[str, Any]],
+    diagnostics: Optional[Dict[str, Any]] = None,
     thread_id: Optional[str] = None,
     reply_to_message_id: Optional[str] = None,
     delivery_uuid: Optional[str] = None,
@@ -274,6 +295,7 @@ async def send_cardkit_delivery(
         serialize_card_for_delivery(card)
         card_id = await client.cardkit_create_card(with_streaming_config(card))
     except Exception as exc:  # noqa: BLE001 - fail-open to the legacy path
+        _bump(diagnostics, "cardkit_send_fallbacks")
         logger.warning("CardKit entity creation failed, using plain card: %s", _safe_error(exc))
         return None
 
@@ -292,6 +314,7 @@ async def send_cardkit_delivery(
             ),
         )
     except Exception as exc:  # noqa: BLE001 - message not sent: fall back
+        _bump(diagnostics, "cardkit_send_fallbacks")
         logger.warning("CardKit message send failed, using plain card: %s", _safe_error(exc))
         return None
 
@@ -301,6 +324,7 @@ async def send_cardkit_delivery(
 
     state = registry().bind(message_id, card_id)
     state.fingerprint = structure_fingerprint(card)
+    _bump(diagnostics, "cardkit_entities")
     try:
         await client.cardkit_set_streaming(
             card_id, enabled=True, sequence=state.next_sequence()
@@ -311,7 +335,12 @@ async def send_cardkit_delivery(
     return result
 
 
-async def deliver_card_update(client: Any, message_id: str, card: Mapping[str, Any]) -> bool:
+async def deliver_card_update(
+    client: Any,
+    message_id: str,
+    card: Mapping[str, Any],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Deliver a card update, preferring element-level streaming.
 
     Returns ``True`` when this transport owns the message (the caller must not
@@ -323,14 +352,16 @@ async def deliver_card_update(client: Any, message_id: str, card: Mapping[str, A
     if state is None:
         return False
 
+    _bump(diagnostics, "cardkit_updates")
     try:
-        await _deliver(client, state, card)
+        await _deliver(client, state, card, diagnostics)
     except Exception as exc:  # noqa: BLE001 - never lose the card
+        _bump(diagnostics, "cardkit_update_fallbacks")
         logger.warning("CardKit update failed, using full card update: %s", _safe_error(exc))
         try:
             await client.cardkit_update_card(
                 state.card_id,
-                _prepare(card),
+                with_streaming_config(_prepare(card)),
                 sequence=state.next_sequence(),
             )
         except Exception as inner:  # noqa: BLE001
@@ -346,7 +377,12 @@ def _prepare(card: Mapping[str, Any]) -> Dict[str, Any]:
     return prepared
 
 
-async def _deliver(client: Any, state: CardState, card: Mapping[str, Any]) -> None:
+async def _deliver(
+    client: Any,
+    state: CardState,
+    card: Mapping[str, Any],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> None:
     prepared, text = collapse_main_content(card)
     serialize_card_for_delivery(prepared)
     fingerprint = structure_fingerprint(prepared)
@@ -354,10 +390,15 @@ async def _deliver(client: Any, state: CardState, card: Mapping[str, Any]) -> No
 
     if structure_changed:
         # Full-card push for structure, carrying the text the client already
-        # shows so the following element stream is a visible growth.
+        # shows so the following element stream is a visible growth, and the
+        # streaming config so this push does not close streaming mode (a card
+        # update without ``streaming_mode`` silently closes it and the next
+        # element push then fails with api_code 300309).
         await client.cardkit_update_card(
             state.card_id,
-            with_body_text(prepared, state.streamed_text if state.has_body else ""),
+            with_streaming_config(
+                with_body_text(prepared, state.streamed_text if state.has_body else "")
+            ),
             sequence=state.next_sequence(),
         )
         state.fingerprint = fingerprint
@@ -372,7 +413,9 @@ async def _deliver(client: Any, state: CardState, card: Mapping[str, Any]) -> No
         # carried the content, so only remember what the client displays.
         if not structure_changed:
             await client.cardkit_update_card(
-                state.card_id, prepared, sequence=state.next_sequence()
+                state.card_id,
+                with_streaming_config(prepared),
+                sequence=state.next_sequence(),
             )
         state.streamed_text = _main_text(prepared)
         state.has_body = True
@@ -402,16 +445,17 @@ async def _deliver(client: Any, state: CardState, card: Mapping[str, Any]) -> No
             )
         state.streamed_text = text
         state.has_body = True
+        _bump(diagnostics, "cardkit_stream_elements")
 
     if _card_is_terminal(prepared):
-        # A completed/failed card must not keep the streaming cursor (and must
-        # be reproducible by the user's screenshot: text final but the card
-        # still "thinking"). Close streaming mode explicitly.
+        # A completed/failed card must not keep the streaming cursor (a finished
+        # card that still shows "thinking" is a real user-visible defect).
         if state.streaming_open:
             await client.cardkit_set_streaming(
                 state.card_id, enabled=False, sequence=state.next_sequence()
             )
             state.streaming_open = False
+            _bump(diagnostics, "cardkit_streaming_closed")
 
 
 def _card_is_terminal(card: Mapping[str, Any]) -> bool:

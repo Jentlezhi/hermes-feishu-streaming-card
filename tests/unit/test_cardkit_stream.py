@@ -93,7 +93,8 @@ class FakeClient:
         self, card_id: str, card: Dict[str, Any], *, sequence: int = 0, **_: Any
     ) -> None:
         body = card["body"]["elements"][0].get("content")
-        self.calls.append(("update_card", card_id, sequence, body))
+        streaming = bool((card.get("config") or {}).get("streaming_mode"))
+        self.calls.append(("update_card", card_id, sequence, body, streaming))
         if self.update_error is not None:
             raise self.update_error
 
@@ -359,6 +360,67 @@ async def test_in_progress_card_keeps_streaming_open() -> None:
     assert await deliver_card_update(client, "om-1", card) is True
     assert "set_streaming" not in client.names()
     assert state.streaming_open is True
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_expose_cardkit_delivery_counters() -> None:
+    """The sidecar's /health must be able to prove the transport ran."""
+
+    diagnostics: Dict[str, Any] = {}
+    client = FakeClient()
+    state = registry().bind("om-1", "card-1")
+    card = make_card("完成态", footer="已完成", header_template="green")
+    state.fingerprint = structure_fingerprint(card)
+    state.streaming_open = True
+    state.streamed_text = "完成态"
+    state.has_body = True
+
+    assert await deliver_card_update(client, "om-1", card, diagnostics) is True
+    assert diagnostics["cardkit_updates"] == 1
+    assert diagnostics["cardkit_streaming_closed"] == 1
+
+    enabled: Dict[str, Any] = {}
+    await send_cardkit_delivery(
+        client=client,
+        chat_id="oc-1",
+        card=make_card("hi"),
+        card_config={"cardkit_streaming": True},
+        diagnostics=enabled,
+    )
+    assert enabled["cardkit_entities"] == 1
+
+    fallback: Dict[str, Any] = {}
+    await send_cardkit_delivery(
+        client=FakeClient(create_error=RuntimeError("down")),
+        chat_id="oc-1",
+        card=make_card("hi"),
+        card_config={"cardkit_streaming": True},
+        diagnostics=fallback,
+    )
+    assert fallback["cardkit_send_fallbacks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_full_card_updates_keep_streaming_mode() -> None:
+    """Regression: an update without streaming_mode closes streaming (300309).
+
+    Verified against the live Feishu API: a full-card update whose config drops
+    ``streaming_mode`` succeeds but silently closes streaming mode, and the next
+    element push then fails with api_code 300309.
+    """
+
+    client = FakeClient()
+    state = registry().bind("om-1", "card-1")
+    state.fingerprint = structure_fingerprint(make_card("", footer="生成中"))
+    state.streaming_open = True
+    state.streamed_text = "第一段"
+    state.has_body = True
+
+    await deliver_card_update(client, "om-1", make_card("第一段第二段", footer="已完成"))
+
+    updates = [call for call in client.calls if call[0] == "update_card"]
+    assert updates, "expected a full-card update"
+    assert all(call[4] is True for call in updates), "updates must keep streaming_mode"
 
 
 # --- send delivery ---------------------------------------------------------
