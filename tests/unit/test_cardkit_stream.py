@@ -423,6 +423,28 @@ async def test_full_card_updates_keep_streaming_mode() -> None:
     assert all(call[4] is True for call in updates), "updates must keep streaming_mode"
 
 
+@pytest.mark.asyncio
+async def test_transport_abandons_card_and_hands_it_back_to_patch() -> None:
+    """Worst case must be "blocky", never "stuck on the loading state".
+
+    Live-verified: PATCH still succeeds on a message that references a card_id,
+    so abandoning the CardKit transport is a safe, complete fallback.
+    """
+
+    client = FakeClient(
+        stream_errors=[FeishuAPIError("boom", outcome="not_sent")],
+        update_error=FeishuAPIError("boom again", outcome="not_sent"),
+    )
+    state = registry().bind("om-1", "card-1")
+    state.fingerprint = structure_fingerprint(make_card(""))
+    state.streaming_open = True
+    diagnostics: Dict[str, Any] = {}
+
+    assert await deliver_card_update(client, "om-1", make_card("答案"), diagnostics) is False
+    assert registry().get("om-1") is None
+    assert diagnostics["cardkit_abandoned"] == 1
+
+
 # --- send delivery ---------------------------------------------------------
 
 

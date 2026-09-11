@@ -346,6 +346,13 @@ async def deliver_card_update(
     Returns ``True`` when this transport owns the message (the caller must not
     fall back to ``PATCH``), ``False`` when the caller should use the legacy
     path.
+
+    Failure policy — a card must never be left stuck on its loading state:
+
+    1. element streaming fails → full-card CardKit update;
+    2. that fails too → unbind the message and return ``False`` so the caller
+       falls back to the proven ``PATCH`` path. ``PATCH`` is verified to work on
+       a message that references a ``card_id``, so the turn still completes.
     """
 
     state = registry().get(message_id)
@@ -364,8 +371,14 @@ async def deliver_card_update(
                 with_streaming_config(_prepare(card)),
                 sequence=state.next_sequence(),
             )
-        except Exception as inner:  # noqa: BLE001
-            logger.warning("CardKit full card update failed: %s", _safe_error(inner))
+        except Exception as inner:  # noqa: BLE001 - hand the card back to PATCH
+            registry().forget(message_id)
+            _bump(diagnostics, "cardkit_abandoned")
+            logger.warning(
+                "CardKit transport abandoned for this message, falling back to PATCH: %s",
+                _safe_error(inner),
+            )
+            return False
     return True
 
 
