@@ -5001,6 +5001,31 @@ def _hfc_notice_context_from_source(
     }
 
 
+# ---- Locale-aware system-notice markers ------------------------------------------
+# Hermes renders system notices through its i18n layer, so ONE notice arrives with
+# different text depending on `display.language`. Matching only the English wording
+# silently demotes the card to a bare text line on every translated install: the review
+# summary ships as "💾 Self-improvement review: …" in en and as "💾 自我改进回顾：…" in zh,
+# so a zh user stopped getting the 「自我改进」card entirely while en users kept it.
+# `locales/<lang>.yaml` in Hermes is the source of truth — add each locale's wording for
+# the corresponding key here whenever a notice gains a translation.
+_HFC_LOCALIZED_NOTICE_MARKERS: dict[str, tuple[str, ...]] = {
+    "home-channel": ("no home channel is set for", "尚未设置主频道"),
+    "skill-loading": ("reading skill", "阅读技能"),
+    "self-improvement": ("self-improvement review", "自我改进回顾"),
+}
+
+
+def _hfc_notice_marker_present(kind: str, text: str, lowered: str) -> bool:
+    """True when either the raw or the case-folded notice text carries a `kind` marker.
+
+    The case-folded copy covers the Latin markers; CJK markers are unaffected by casing,
+    so checking both keeps the predicate correct for either script.
+    """
+    return any(marker in lowered or marker in text
+               for marker in _HFC_LOCALIZED_NOTICE_MARKERS[kind])
+
+
 def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
     raw_text = str(content or "")
     if not raw_text.strip():
@@ -5036,7 +5061,7 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
             "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
             "plain_text": _HFC_GATEWAY_ONLINE_TEXT,
         }
-    if text.startswith("📬 No home channel is set for Feishu."):
+    if _hfc_notice_marker_present("home-channel", text, lowered):
         return {
             "title": "默认投递位置未设置", "level": "info",
             "notice_kind": "home-channel", "notice_id": "home-channel",
@@ -5077,14 +5102,14 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
             "notice_kind": "session-reset",
             "notice_id": "session-reset",
         }
-    if "reading skill" in lowered:
+    if _hfc_notice_marker_present("skill-loading", text, lowered):
         return {
             "title": "技能加载",
             "level": "info",
             "notice_kind": "skill-loading",
             "notice_id": _hfc_content_notice_id("skill-loading", text),
         }
-    if "self-improvement review" in lowered:
+    if _hfc_notice_marker_present("self-improvement", text, lowered):
         return {
             "title": "自我改进",
             "level": "info",
