@@ -9,11 +9,33 @@ from hermes_feishu_card import hook_runtime
 @pytest.mark.parametrize('text,kind', [
     ('📬 No home channel is set for Feishu. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip.', 'home-channel'),
     ('ℹ️ 上下文压缩已推迟 — 摘要仍在生成中。本回合将不压缩继续。', 'compression'),
+    # Hermes renders these three through its i18n layer, so a translated install sends the
+    # localized wording instead of the English one. The classifier used to match only the
+    # English text, which silently demoted the card to a plain line for every zh user.
+    ('💾 Self-improvement review: Memory updated', 'self-improvement'),
+    ('💾 自我改进回顾：技能 \'hfc-feishu-card-install\' 已修补 · 记忆已更新', 'self-improvement'),
+    ('Reading skill', 'skill-loading'),
+    ('阅读技能', 'skill-loading'),
+    ('📬 Feishu 尚未设置主频道。主频道是 Hermes 投递定时任务结果和跨平台消息的地方。', 'home-channel'),
 ])
 def test_observed_operational_notices_are_routed_as_notices(text, kind):
     result = hook_runtime._hfc_classify_system_notice(text)
     assert result is not None
     assert result['notice_kind'] == kind
+
+
+@pytest.mark.parametrize('text', [
+    '⏳ Working — loading the model…',
+    '♻ 网关已成功重启。你的会话继续有效。',
+    '这是一条普通回复正文，不该被当成系统通知。',
+])
+def test_plain_lines_stay_out_of_the_notice_cards(text):
+    """Notices Hermes does not translate must keep their plain-text path.
+
+    The gateway-online line is deliberately plain text, and its ``plain_text`` contract is
+    an English constant — routing the zh wording into it would send English to a zh user.
+    """
+    assert hook_runtime._hfc_classify_system_notice(text) is None
 
 
 def test_current_event_anchor_wins_over_stale_source_message():
