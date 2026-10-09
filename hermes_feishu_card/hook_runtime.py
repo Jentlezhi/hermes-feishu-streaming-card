@@ -5111,16 +5111,32 @@ _HFC_NOTICE_MARKER_DEFAULTS: dict[str, tuple[str, str, bool]] = {
 
 
 def _hfc_hermes_locale_dir() -> Path | None:
-    """Locate Hermes' ``locales/`` directory from the running interpreter, or None."""
+    """Locate Hermes' ``locales/`` directory, or None.
+
+    Tried in order: the importable ``hermes_cli`` package (the normal case inside the gateway),
+    then any ``sys.path`` entry that carries a locale pack — the gateway's plugin runtime does
+    not always have ``hermes_cli`` importable even though the pack is on disk.
+    """
+    candidates: list[Path] = []
     try:
         import hermes_cli  # type: ignore
+        candidates.append(Path(hermes_cli.__file__).resolve().parent.parent / "locales")
     except Exception:
-        return None
-    try:
-        candidate = Path(hermes_cli.__file__).resolve().parent.parent / "locales"
-    except Exception:
-        return None
-    return candidate if candidate.is_dir() else None
+        pass
+    for entry in list(sys.path):
+        if not entry:
+            continue
+        try:
+            candidates.append(Path(entry) / "locales")
+        except Exception:
+            continue
+    for candidate in candidates:
+        try:
+            if candidate.is_dir() and (candidate / "en.yaml").is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _hfc_locale_notice_markers() -> dict[str, tuple[str, ...]]:

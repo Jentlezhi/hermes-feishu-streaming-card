@@ -193,6 +193,13 @@ def test_malformed_structured_notice_fails_open(text):
     ("💾 Selbstverbesserungs-Review: x", "self-improvement"),
 ])
 def test_locale_pack_wording_is_carded(text, expected_kind):
+    """Only meaningful where Hermes' locale pack is on disk (a dev/installed checkout).
+
+    A bare clone has no pack, so this is skipped rather than failing: without it the derived
+    markers are empty by design and the hand-written table still covers en/zh.
+    """
+    if hook_runtime._hfc_hermes_locale_dir() is None:
+        pytest.skip("Hermes locale pack not on disk")
     result = hook_runtime._hfc_classify_system_notice(text)
     assert result is not None, f"locale wording fell through: {text}"
     assert result["notice_kind"] == expected_kind
