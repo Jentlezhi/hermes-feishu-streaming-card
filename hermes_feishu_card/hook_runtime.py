@@ -5003,27 +5003,213 @@ def _hfc_notice_context_from_source(
 
 # ---- Locale-aware system-notice markers ------------------------------------------
 # Hermes renders system notices through its i18n layer, so ONE notice arrives with
-# different text depending on `display.language`. Matching only the English wording
-# silently demotes the card to a bare text line on every translated install: the review
+# different text depending on `display.language`. Matching only one language's wording
+# silently demotes the card to a bare text line on every other install: the review
 # summary ships as "💾 Self-improvement review: …" in en and as "💾 自我改进回顾：…" in zh,
 # so a zh user stopped getting the 「自我改进」card entirely while en users kept it.
 # `locales/<lang>.yaml` in Hermes is the source of truth — add each locale's wording for
 # the corresponding key here whenever a notice gains a translation.
-_HFC_LOCALIZED_NOTICE_MARKERS: dict[str, tuple[str, ...]] = {
-    "home-channel": ("no home channel is set for", "尚未设置主频道"),
-    "skill-loading": ("reading skill", "阅读技能"),
-    "self-improvement": ("self-improvement review", "自我改进回顾"),
+#
+# Entries are checked in order and the FIRST match wins, so a narrower marker must be
+# listed above any broader one that would also swallow it.
+_HFC_NOTICE_MARKER_TABLE: tuple[tuple[str, str, str, tuple[str, ...], bool], ...] = (
+    # (notice_kind, title, level, markers, terminal)
+    ("home-channel", "默认投递位置未设置", "info",
+     ("no home channel is set for", "尚未设置主频道"), False),
+    ("context-injection", "上下文注入被拒绝", "warning",
+     ("context injection refused", "上下文注入已被拒绝"), False),
+    ("skill-loading", "技能加载", "info",
+     ("reading skill", "阅读技能"), False),
+    ("self-improvement", "自我改进", "info",
+     ("self-improvement review", "自我改进回顾"), False),
+    ("session-reset", "会话已自动重置", "success",
+     ("session automatically reset", "会话已自动重置"), False),
+    # Both review warnings carry the config path verbatim in every locale, so the key
+    # itself is the most reliable marker.
+    ("review-config", "后台审查配置提示", "warning",
+     ("auxiliary.background_review",), False),
+    ("database", "会话数据库异常", "error",
+     ("session database", "会话数据库"), False),
+    # "caps context at" is an English-only status line (agent_init, not i18n'd); the rest
+    # are the localized `gateway.compress.*` wordings.
+    ("context-cap", "上下文窗口提示", "info",
+     ("caps context", "上下文窗口"), False),
+    ("compression", "上下文压缩提示", "info",
+     ("context compression", "compression model", "compression threshold",
+      "compression summary failed", "compaction failed", "compression is currently blocked",
+      "上下文压缩", "压缩已中止", "压缩失败", "摘要生成失败", "配置的压缩模型"), False),
+    ("media-delivery", "附件发送失败", "warning",
+     ("couldn't deliver the", "无法发送"), False),
+    ("delivery-failure", "消息发送失败", "error",
+     ("message delivery failed", "消息仍发送失败"), False),
+    ("plain-fallback", "响应格式化降级", "warning",
+     ("response formatting failed", "响应格式化失败"), False),
+    ("turn-error", "本轮执行出错", "error",
+     ("sorry, i encountered an error", "抱歉，我遇到了一个错误"), False),
+)
+
+
+# A notice that leads with one of these glyphs is operational status the user should see as a
+# card — never a bare text line. The list is deliberately glyph-based: Hermes adds new notices
+# faster than any marker table can track, and an unmapped notice silently degrading to plain
+# text is the exact failure this guards against.
+_HFC_NOTICE_STATUS_GLYPHS = ("⚠", "❌", "ℹ", "⛔", "💾", "📬", "🔄")
+
+# These carry their own structured contract (see `_hfc_classify_background_notice`). A MALFORMED
+# member of the family must fail OPEN to the adapter's plain-text path rather than be promoted by
+# the generic glyph fallback into a card with no parsed process/task id.
+_HFC_STRUCTURED_NOTICE_PREFIXES = (
+    "[Background process ",
+    "✅ Background task",
+    "🔄 Background task",
+    "❌ Background task",
+)
+
+
+# A derived marker must be at least this long to be trusted — shorter fragments would match
+# unrelated text. Prefixes are cut at the template's first placeholder.
+_HFC_LOCALE_MARKER_MIN_CHARS = 8
+
+# notice_kind -> Hermes i18n keys whose rendered wording identifies that notice. Kept keyed by
+# kind (not by literal text) so the wording follows the locale pack instead of going stale.
+_HFC_NOTICE_I18N_KEYS: dict[str, tuple[str, ...]] = {
+    "home-channel": ("gateway.notify.no_home_channel",),
+    "turn-error": ("gateway.notify.turn_error", "gateway.notify.turn_error_detailed"),
+    "context-injection": ("gateway.notify.context_injection_refused",),
+    "media-delivery": ("gateway.notify.media_delivery_failed",
+                       "gateway.notify.media_delivery_failed_with_name"),
+    "delivery-failure": ("gateway.notify.delivery_failed_retry",),
+    "plain-fallback": ("gateway.notify.plain_fallback_prefix",),
+    "database": ("gateway.startup.db_corrupt", "gateway.startup.db_fts_corrupt",
+                 "gateway.startup.db_unavailable"),
+    "compression": ("gateway.compress.summary_failed", "gateway.compress.aborted",
+                    "gateway.compress.aux_failed", "gateway.compress.turnhold_deferred"),
+    "self-improvement": ("display.review.summary_callback",),
+    "review-config": ("display.review.routing_fallback_warning",
+                      "display.review.reasoning_effort_warning"),
+}
+
+_HFC_LOCALE_MARKER_CACHE: dict[str, dict[str, tuple[str, ...]]] = {}
+
+# Title/level/terminal for a kind, used when the marker came from the locale pack rather than a
+# hand-written row. Must stay in sync with `_HFC_NOTICE_MARKER_TABLE`.
+_HFC_NOTICE_MARKER_DEFAULTS: dict[str, tuple[str, str, bool]] = {
+    "home-channel": ("默认投递位置未设置", "info", False),
+    "turn-error": ("本轮执行出错", "error", False),
+    "context-injection": ("上下文注入被拒绝", "warning", False),
+    "media-delivery": ("附件发送失败", "warning", False),
+    "delivery-failure": ("消息发送失败", "error", False),
+    "plain-fallback": ("响应格式化降级", "warning", False),
+    "database": ("会话数据库异常", "error", False),
+    "compression": ("上下文压缩提示", "info", False),
+    "self-improvement": ("自我改进", "info", False),
+    "review-config": ("后台审查配置提示", "warning", False),
+    "context-cap": ("上下文窗口提示", "info", False),
+    "session-reset": ("会话已自动重置", "success", False),
+    "skill-loading": ("技能加载", "info", False),
 }
 
 
-def _hfc_notice_marker_present(kind: str, text: str, lowered: str) -> bool:
-    """True when either the raw or the case-folded notice text carries a `kind` marker.
+def _hfc_hermes_locale_dir() -> Path | None:
+    """Locate Hermes' ``locales/`` directory from the running interpreter, or None."""
+    try:
+        import hermes_cli  # type: ignore
+    except Exception:
+        return None
+    try:
+        candidate = Path(hermes_cli.__file__).resolve().parent.parent / "locales"
+    except Exception:
+        return None
+    return candidate if candidate.is_dir() else None
 
-    The case-folded copy covers the Latin markers; CJK markers are unaffected by casing,
-    so checking both keeps the predicate correct for either script.
+
+def _hfc_locale_notice_markers() -> dict[str, tuple[str, ...]]:
+    """Derive per-locale notice markers from Hermes' own locale pack (cached, fail-open).
+
+    Hand-copying wording is how a localized install silently lost the review card: the marker
+    knew ``Self-improvement review`` but the install sent ``自我改进回顾``. Reading the pack
+    keeps coverage for every shipped language without a per-language table, and a missing or
+    unreadable pack simply yields no extra markers — the hand-written table and the glyph
+    fallback still classify.
     """
-    return any(marker in lowered or marker in text
-               for marker in _HFC_LOCALIZED_NOTICE_MARKERS[kind])
+    cached = _HFC_LOCALE_MARKER_CACHE.get("markers")
+    if cached is not None:
+        return cached
+    derived: dict[str, list[str]] = {}
+    locale_dir = _hfc_hermes_locale_dir()
+    if locale_dir is not None:
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            yaml = None  # type: ignore[assignment]
+        if yaml is not None:
+            for path in sorted(locale_dir.glob("*.yaml")):
+                if path.name.endswith(".tui.yaml"):
+                    continue
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        doc = yaml.safe_load(handle)
+                except Exception:
+                    continue
+                for kind, keys in _HFC_NOTICE_I18N_KEYS.items():
+                    for key in keys:
+                        node: Any = doc
+                        for part in key.split("."):
+                            node = node.get(part) if isinstance(node, dict) else None
+                            if node is None:
+                                break
+                        if not isinstance(node, str) or "{" in node and "}" not in node:
+                            continue
+                        marker = node.split("{", 1)[0].strip().rstrip("(（[【:：,，")
+                        marker = marker.strip()
+                        if len(marker) < _HFC_LOCALE_MARKER_MIN_CHARS:
+                            continue
+                        bucket = derived.setdefault(kind, [])
+                        if marker not in bucket:
+                            bucket.append(marker)
+    frozen = {kind: tuple(markers) for kind, markers in derived.items()}
+    _HFC_LOCALE_MARKER_CACHE["markers"] = frozen
+    return frozen
+
+
+def _hfc_notice_marker_match(text: str, lowered: str) -> tuple[str, str, str, bool] | None:
+    """Return ``(kind, title, level, terminal)`` for the first matching marker row.
+
+    Markers are probed against both the raw and the case-folded text: Latin markers rely on
+    case folding, CJK markers are unaffected by it, and probing both keeps the predicate
+    correct for either script. The hand-written table wins; locale-derived markers from the
+    Hermes locale pack extend it to every shipped language.
+    """
+    for kind, title, level, markers, terminal in _HFC_NOTICE_MARKER_TABLE:
+        if any(marker in lowered or marker in text for marker in markers):
+            return kind, title, level, terminal
+    for kind, markers in _hfc_locale_notice_markers().items():
+        if any(marker in text or marker.lower() in lowered for marker in markers):
+            row = _HFC_NOTICE_MARKER_DEFAULTS.get(kind)
+            if row is not None:
+                return kind, row[0], row[1], row[2]
+    return None
+
+
+def _hfc_notice_glyph_card(text: str) -> dict[str, Any]:
+    """Generic card for an operational notice the marker table has no entry for.
+
+    Keeps card coverage complete as Hermes gains notices: without it a new notice falls through
+    to `return None` and the user sees a bare text line where every other notice is a card.
+    Level is derived from the leading glyph so severity still reads correctly.
+    """
+    if text.startswith(("⚠", "❌", "⛔")):
+        level = "warning" if text.startswith("⚠") else "error"
+    elif text.startswith(("ℹ", "📬", "🔄")):
+        level = "info"
+    else:
+        level = "success"
+    return {
+        "title": "系统提示",
+        "level": level,
+        "notice_kind": "operational",
+        "notice_id": _hfc_content_notice_id("operational", text),
+    }
 
 
 def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
@@ -5054,23 +5240,17 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
         # back and ready." `_hfc_send_system_notice_card` honours `plain_text` by sending exactly
         # this line through the adapter's own text send; `title`/`level`/`content` stay for the
         # classification contract and any caller that still renders one.
+        #
+        # The match is English-only ON PURPOSE. A translated install sends a different wording,
+        # which falls through to `return None` and lets the CORE emit its own already-localized
+        # line — the same plain-text outcome, without handing a zh user the English
+        # `_HFC_GATEWAY_ONLINE_TEXT` constant this notice declares.
         return {
             "title": "Gateway 重启完成", "level": "success",
             "notice_kind": "gateway-restart", "notice_id": "gateway-restart-ready",
             "notice_terminal": True,
             "content": "Gateway 已重启完成，会话已保留。现在可以发送新任务。",
             "plain_text": _HFC_GATEWAY_ONLINE_TEXT,
-        }
-    if _hfc_notice_marker_present("home-channel", text, lowered):
-        return {
-            "title": "默认投递位置未设置", "level": "info",
-            "notice_kind": "home-channel", "notice_id": "home-channel",
-        }
-    if text.startswith("ℹ️ 上下文压缩已推迟"):
-        return {
-            "title": "上下文压缩提示", "level": "info",
-            "notice_kind": "compression",
-            "notice_id": _hfc_content_notice_id("compression", text),
         }
     if text.startswith("⏳") or lowered.startswith("working ") or "working —" in lowered:
         # Maintainer note (contract change): the ⏳ status line is NEVER a card.
@@ -5087,42 +5267,27 @@ def _hfc_classify_system_notice(content: Any) -> dict[str, Any] | None:
         # Queue/error acknowledgements and answer content remain visible. The edit
         # path also still works: `_hfc_edit_message_with_system_notice_card` falls back to the
         # original edit once classification returns None, so a refreshing status updates ONE line.
+        #
+        # Keep this check ABOVE the marker table: the table matches by substring, and a
+        # transient line that quotes an operational phrase would otherwise be promoted to a card.
         return None
-    if "caps context" in lowered and "auto-compaction" in lowered:
-        return {
-            "title": "上下文窗口提示",
-            "level": "info",
-            "notice_kind": "context-cap",
-            "notice_id": "context-cap",
+    matched = _hfc_notice_marker_match(text, lowered)
+    if matched is not None:
+        kind, title, level, terminal = matched
+        notice: dict[str, Any] = {
+            "title": title,
+            "level": level,
+            "notice_kind": kind,
+            "notice_id": _hfc_content_notice_id(kind, text),
         }
-    if "session automatically reset" in lowered:
-        return {
-            "title": "会话已自动重置",
-            "level": "success",
-            "notice_kind": "session-reset",
-            "notice_id": "session-reset",
-        }
-    if _hfc_notice_marker_present("skill-loading", text, lowered):
-        return {
-            "title": "技能加载",
-            "level": "info",
-            "notice_kind": "skill-loading",
-            "notice_id": _hfc_content_notice_id("skill-loading", text),
-        }
-    if _hfc_notice_marker_present("self-improvement", text, lowered):
-        return {
-            "title": "自我改进",
-            "level": "info",
-            "notice_kind": "self-improvement",
-            "notice_id": _hfc_content_notice_id("self-improvement", text),
-        }
-    if "context compression" in lowered or "compression model" in lowered:
-        return {
-            "title": "上下文压缩提示",
-            "level": "info",
-            "notice_kind": "compression",
-            "notice_id": _hfc_content_notice_id("compression", text),
-        }
+        if terminal:
+            notice["notice_terminal"] = True
+        return notice
+    # Last resort: an operational notice the marker table does not name yet still becomes a card,
+    # so a new Hermes notice never degrades to a bare text line next to carded ones. Notices with
+    # their own structured contract are excluded — a malformed one must fail open, not be carded.
+    if text.startswith(_HFC_NOTICE_STATUS_GLYPHS) and not text.startswith(_HFC_STRUCTURED_NOTICE_PREFIXES):
+        return _hfc_notice_glyph_card(text)
     return None
 
 
